@@ -1,82 +1,99 @@
-require('./settings')
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+  fetchLatestBaileysVersion,
+  makeInMemoryStore
+} = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
-const fs = require('fs')
+const figlet = require('figlet')
 const chalk = require('chalk')
-const FileType = require('file-type')
+const fs = require('fs')
 const path = require('path')
-const axios = require('axios')
-const readline = require("readline")
-const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
-const PhoneNumber = require('awesome-phonenumber')
-const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
-const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
-const { 
-    default: makeWASocket,
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion,
-    jidDecode,
-    proto,
-    jidNormalizedUser,
-    makeCacheableSignalKeyStore,
-    delay
-} = require("@whiskeysockets/baileys")
-const NodeCache = require("node-cache")
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const question = (text) => new Promise((resolve) => rl.question(text, resolve))
+const store = makeInMemoryStore({ logger: console })
+store.readFromFile('./store.json')
+setInterval(() => {
+  store.writeToFile('./store.json')
+}, 10000)
+
+console.log(chalk.cyan(figlet.textSync('Nixx MD', { horizontalLayout: 'full' })))
+console.log(chalk.green('WhatsApp RPG Bot by Skyzo\n'))
+
+// Load all commands
+const commands = new Map()
+const commandPath = path.join(__dirname, 'commands')
+fs.readdirSync(commandPath).forEach(file => {
+  if (file.endsWith('.js')) {
+    const cmd = require(path.join(commandPath, file))
+    commands.set(cmd.name, cmd)
+    if (cmd.aliases && Array.isArray(cmd.aliases)) {
+      cmd.aliases.forEach(alias => commands.set(alias, cmd))
+    }
+  }
+})
 
 async function startBot() {
-    const { version, isLatest } = await fetchLatestBaileysVersion()
-    const { state, saveCreds } = await useMultiFileAuthState(`./session`)
-    const msgRetryCounterCache = new NodeCache()
+  const { state, saveCreds } = await useMultiFileAuthState('./session')
+  const { version } = await fetchLatestBaileysVersion()
 
-    const sock = makeWASocket({
-        version,
-        logger: require('pino')({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, require('pino')().child({ level: 'silent' })),
-        },
-        markOnlineOnConnect: true,
-        msgRetryCounterCache,
-        generateHighQualityLinkPreview: true,
-        getMessage: async (key) => ({ message: "" })
-    })
+  const sock = makeWASocket({
+    version,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, console)
+    },
+    printQRInTerminal: false,
+    browser: ['Nixx MD', 'Chrome', '1.0.0']
+  })
 
-    if (!sock.authState.creds.registered) {
-        const input = await question(chalk.green("Masukkan nomor WhatsApp kamu (cth: 6281234567890): "))
-        let phoneNumber = input.replace(/[^0-9]/g, '')
-        if (!phoneNumber.startsWith('62') && !phoneNumber.startsWith('91')) {
-            phoneNumber = '62' + phoneNumber
-        }
+  store.bind(sock.ev)
 
-        console.log(chalk.yellow("Meminta pairing code..."))
-        try {
-            let code = await sock.requestPairingCode(phoneNumber)
-            code = code?.match(/.{1,4}/g)?.join("-") || code
-            console.log(chalk.black(chalk.bgGreen("\nKode Pairing Kamu:")), chalk.white(code))
-            console.log(chalk.yellow(`\nCara menghubungkan:\n1. Buka WhatsApp\n2. Pengaturan > Perangkat Tertaut\n3. Tautkan Perangkat\n4. Masukkan kode di atas.`))
-        } catch (err) {
-            console.error(chalk.red("Gagal mendapatkan pairing code:"), err)
-        }
+  // Pairing code login (nomor kamu udah diisi otomatis)
+  if (!sock.authState.creds.registered) {
+    const phoneNumber = '6287831823978@s.whatsapp.net'
+    let code = await sock.requestPairingCode(phoneNumber)
+    console.log(chalk.yellow(`\n💬 Pairing code untuk ${phoneNumber}: ${chalk.cyan(code)}`))
+  }
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0]
+    if (!msg.message || msg.key.fromMe) return
+
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+    if (!text.startsWith('.')) return
+
+    const [cmdName, ...args] = text.slice(1).trim().split(/\s+/)
+    const command = commands.get(cmdName.toLowerCase())
+
+    if (command) {
+      try {
+        await command.execute(msg, args, sock)
+      } catch (err) {
+        console.error('[ERROR COMMAND]', err)
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Terjadi error saat menjalankan command!' })
+      }
+    }
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+
+  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+    if (connection === 'close') {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log(chalk.yellow('🔄 Koneksi terputus. Menghubungkan ulang...'))
+        startBot()
+      } else {
+        console.log(chalk.red('❌ Akun logout. Hapus folder session dan login ulang.'))
+      }
     }
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update
-        if (connection === 'open') {
-            console.log(chalk.green('✅ Berhasil terhubung ke WhatsApp!'))
-        } else if (connection === 'close') {
-            console.log(chalk.red('❌ Koneksi ditutup. Mengulang...'))
-            if (lastDisconnect?.error?.output?.statusCode !== 401) {
-                startBot()
-            }
-        }
-    })
-
-    sock.ev.on('creds.update', saveCreds)
+    if (connection === 'open') {
+      console.log(chalk.green('✅ Bot berhasil terhubung ke WhatsApp!'))
+    }
+  })
 }
 
-startBot().catch(err => console.error('❌ Error:', err))
+startBot()
